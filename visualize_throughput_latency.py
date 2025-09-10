@@ -4,6 +4,7 @@ Generates plots for cluster throughput and time-to-first-token latency.
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
 from requirements import estimate_reqs_qwen3
 
 # Hardware constants from README
@@ -100,11 +101,12 @@ def generate_performance_plots():
     ctx_small = gen_context_lengths[0]
     utils_small = gen_util_data[ctx_small]
     axs[1, 0].set_title(f'Resource Utilization (Ctx: {ctx_small//1024}k)', fontsize=14)
-    axs[1, 0].set_ylabel('Utilization Ratio', fontsize=label_fontsize)
+    axs[1, 0].set_ylabel('Utilization (%)', fontsize=label_fontsize)
     axs[1, 0].plot(gen_batch_sizes, utils_small['mem'], color=colors[0], linestyle=linestyles['mem'], label='Memory')
     axs[1, 0].plot(gen_batch_sizes, utils_small['inter'], color=colors[0], linestyle=linestyles['inter'], label='Interconnect')
     axs[1, 0].plot(gen_batch_sizes, utils_small['flops'], color=colors[0], linestyle=linestyles['flops'], label='FLOPs')
     axs[1, 0].set_ylim(0, 1.1)
+    axs[1, 0].yaxis.set_major_formatter(PercentFormatter(1.0))
     axs[1, 0].grid(True, which="both", ls="--")
     axs[1, 0].legend()
     axs[1, 0].tick_params(axis='y', labelsize=tick_fontsize)
@@ -114,11 +116,12 @@ def generate_performance_plots():
     utils_large = gen_util_data[ctx_large]
     color_large_ctx = colors[len(gen_context_lengths) - 1]
     axs[2, 0].set_title(f'Resource Utilization (Ctx: {ctx_large//1024}k)', fontsize=14)
-    axs[2, 0].set_ylabel('Utilization Ratio', fontsize=label_fontsize)
+    axs[2, 0].set_ylabel('Utilization (%)', fontsize=label_fontsize)
     axs[2, 0].plot(gen_batch_sizes, utils_large['mem'], color=color_large_ctx, linestyle=linestyles['mem'], label='Memory')
     axs[2, 0].plot(gen_batch_sizes, utils_large['inter'], color=color_large_ctx, linestyle=linestyles['inter'], label='Interconnect')
     axs[2, 0].plot(gen_batch_sizes, utils_large['flops'], color=color_large_ctx, linestyle=linestyles['flops'], label='FLOPs')
     axs[2, 0].set_ylim(0, 1.1)
+    axs[2, 0].yaxis.set_major_formatter(PercentFormatter(1.0))
     axs[2, 0].grid(True, which="both", ls="--")
     axs[2, 0].legend()
     axs[2, 0].set_xlabel('Batch Size', fontsize=label_fontsize)
@@ -140,10 +143,12 @@ def generate_performance_plots():
     bs_small = prefill_batch_sizes[0]
     utils_small = prefill_util_data[bs_small]
     axs[1, 1].set_title(f'Resource Utilization (Batch: {bs_small})', fontsize=14)
+    axs[1, 1].set_ylabel('Utilization (%)', fontsize=label_fontsize)
     axs[1, 1].plot(prefill_prompt_lengths, utils_small['mem'], color=colors[0], linestyle=linestyles['mem'], label='Memory')
     axs[1, 1].plot(prefill_prompt_lengths, utils_small['inter'], color=colors[0], linestyle=linestyles['inter'], label='Interconnect')
     axs[1, 1].plot(prefill_prompt_lengths, utils_small['flops'], color=colors[0], linestyle=linestyles['flops'], label='FLOPs')
     axs[1, 1].set_ylim(0, 1.1)
+    axs[1, 1].yaxis.set_major_formatter(PercentFormatter(1.0))
     axs[1, 1].grid(True, which="both", ls="--")
     axs[1, 1].legend()
     axs[1, 1].tick_params(axis='y', labelsize=tick_fontsize)
@@ -153,10 +158,12 @@ def generate_performance_plots():
     utils_large = prefill_util_data[bs_large]
     color_large_bs = colors[len(prefill_batch_sizes) - 1]
     axs[2, 1].set_title(f'Resource Utilization (Batch: {bs_large})', fontsize=14)
+    axs[2, 1].set_ylabel('Utilization (%)', fontsize=label_fontsize)
     axs[2, 1].plot(prefill_prompt_lengths, utils_large['mem'], color=color_large_bs, linestyle=linestyles['mem'], label='Memory')
     axs[2, 1].plot(prefill_prompt_lengths, utils_large['inter'], color=color_large_bs, linestyle=linestyles['inter'], label='Interconnect')
     axs[2, 1].plot(prefill_prompt_lengths, utils_large['flops'], color=color_large_bs, linestyle=linestyles['flops'], label='FLOPs')
     axs[2, 1].set_ylim(0, 1.1)
+    axs[2, 1].yaxis.set_major_formatter(PercentFormatter(1.0))
     axs[2, 1].grid(True, which="both", ls="--")
     axs[2, 1].legend()
     axs[2, 1].set_xlabel('Prompt Length (Tokens)', fontsize=label_fontsize)
