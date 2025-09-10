@@ -114,25 +114,28 @@ def estimate_reqs_attention(batch_size: int, context_length: int = 128 * 1024, i
         kv_cache_read = batch_size * (effective_seq_len - 1) * kv_heads_per_node * HEAD_DIM * ACTIVATION_BYTES * 2  # K + V
         memory_per_forward_pass += kv_cache_read
 
-    # FLOPs for all tokens processed
+    # FLOPs for all tokens processed (per node)
+    # Each FMA is 2 FLOPs (multiply + add)
     heads_per_node = NUM_Q_HEADS // NUM_NODES
+    kv_heads_per_node = NUM_KV_HEADS // NUM_NODES
 
-    # Q @ K^T: batch_size * heads_per_node * effective_seq_len * head_dim per token processed
-    qk_flops_per_token = batch_size * heads_per_node * effective_seq_len * HEAD_DIM
+    # Q, K, V projections from hidden dim.
+    # Note: HIDDEN_DIM = NUM_Q_HEADS * HEAD_DIM
+    q_proj_flops = tokens_processed * 2 * HIDDEN_DIM * (heads_per_node * HEAD_DIM)
+    k_proj_flops = tokens_processed * 2 * HIDDEN_DIM * (kv_heads_per_node * HEAD_DIM)
+    v_proj_flops = tokens_processed * 2 * HIDDEN_DIM * (kv_heads_per_node * HEAD_DIM)
 
-    # Attention weights @ V: batch_size * heads_per_node * effective_seq_len * head_dim per token processed
-    av_flops_per_token = batch_size * heads_per_node * effective_seq_len * HEAD_DIM
+    # Attention computation (assumes Flash Attention)
+    # Q @ K^T
+    qk_flops = tokens_processed * 2 * heads_per_node * effective_seq_len * HEAD_DIM
+    # Attention weights @ V
+    av_flops = tokens_processed * 2 * heads_per_node * effective_seq_len * HEAD_DIM
 
-    # Output projection: batch_size * hidden_dim * (hidden_dim // num_nodes) per token processed
-    o_flops_per_token = batch_size * HIDDEN_DIM * (HIDDEN_DIM // NUM_NODES)
+    # Output projection. Input is HIDDEN_DIM, output is HIDDEN_DIM.
+    # Matrix is column-split, so each node computes (HIDDEN_DIM, HIDDEN_DIM / NUM_NODES)
+    o_proj_flops = tokens_processed * 2 * HIDDEN_DIM * (HIDDEN_DIM // NUM_NODES)
 
-    # Total FLOPs for forward pass
-    if is_prefill:
-        # For prefill, FLOPs scale with context_length tokens processed
-        flops_per_forward_pass = (qk_flops_per_token + av_flops_per_token) * context_length + o_flops_per_token * context_length
-    else:
-        # For generation, just process 1 new token per sequence
-        flops_per_forward_pass = qk_flops_per_token + av_flops_per_token + o_flops_per_token
+    flops_per_forward_pass = q_proj_flops + k_proj_flops + v_proj_flops + qk_flops + av_flops + o_proj_flops
 
     # Interconnect: gather attention outputs from all nodes for all tokens processed
     interconnect_per_forward_pass = (NUM_NODES - 1) * tokens_processed * (HIDDEN_DIM // NUM_NODES) * ACTIVATION_BYTES
@@ -177,44 +180,39 @@ def estimate_reqs_moe_mlp(batch_size: int, context_length: int = 128 * 1024, is_
 
     memory_per_forward_pass = expert_params_total + gate_network_params
 
-    # Activations for all tokens processed: input, intermediate outputs
-    expert_activations = tokens_processed * (
-        HIDDEN_DIM +  # Input
+    # Activations for all tokens processed: read input, write/read intermediates, write final output
+    # Input is read once, final output is written once. Intermediates are per-expert.
+    input_activation_bytes = tokens_processed * HIDDEN_DIM * ACTIVATION_BYTES
+    intermediate_activation_bytes = tokens_processed * ACTIVATED_EXPERTS_PER_NODE * (
         INTERMEDIATE_DIM +  # Gate output
         INTERMEDIATE_DIM +  # Up output
-        HIDDEN_DIM  # Down output
-    ) * ACTIVATION_BYTES * ACTIVATED_EXPERTS_PER_NODE
+        INTERMEDIATE_DIM    # SwiGLU output (written then read)
+    ) * ACTIVATION_BYTES
+    output_activation_bytes = tokens_processed * HIDDEN_DIM * ACTIVATION_BYTES
+    expert_activations = input_activation_bytes + intermediate_activation_bytes + output_activation_bytes
 
     memory_per_forward_pass += expert_activations
 
-    # FLOPs per activated expert for all tokens processed
-    flops_per_expert_per_token = batch_size * (
-        HIDDEN_DIM * INTERMEDIATE_DIM +  # Gate
-        HIDDEN_DIM * INTERMEDIATE_DIM +  # Up
-        INTERMEDIATE_DIM * HIDDEN_DIM +  # Down
-        INTERMEDIATE_DIM  # SwiGLU activation
+    # FLOPs for all tokens processed. Each FMA is 2 FLOPs.
+    # Gating network FLOPs
+    gate_flops = tokens_processed * 2 * HIDDEN_DIM * (TOTAL_EXPERTS // NUM_NODES)
+
+    # Expert FLOPs (per expert)
+    flops_per_expert = tokens_processed * (
+        2 * HIDDEN_DIM * INTERMEDIATE_DIM +  # Gate projection
+        2 * HIDDEN_DIM * INTERMEDIATE_DIM +  # Up projection
+        INTERMEDIATE_DIM +                   # SwiGLU activation
+        2 * INTERMEDIATE_DIM * HIDDEN_DIM    # Down projection
     )
+    expert_flops = ACTIVATED_EXPERTS_PER_NODE * flops_per_expert
+    flops_per_forward_pass = gate_flops + expert_flops
 
-    # Total FLOPs for forward pass
-    if is_prefill:
-        flops_per_forward_pass = ACTIVATED_EXPERTS_PER_NODE * flops_per_expert_per_token * context_length
-    else:
-        flops_per_forward_pass = ACTIVATED_EXPERTS_PER_NODE * flops_per_expert_per_token
-
-    # Gating network FLOPs for all tokens processed
-    gate_flops_per_token = batch_size * HIDDEN_DIM * (TOTAL_EXPERTS // NUM_NODES)
-    if is_prefill:
-        gate_flops = gate_flops_per_token * context_length
-    else:
-        gate_flops = gate_flops_per_token
-
-    flops_per_forward_pass += gate_flops
-
-    # Interconnect: Expert routing decisions and output aggregation for all tokens processed
-    routing_bytes_per_token = TOTAL_EXPERTS // 8  # Routing decisions (bits to bytes)
-    output_bytes_per_token = batch_size * HIDDEN_DIM * ACTIVATION_BYTES
-
-    interconnect_per_forward_pass = (NUM_NODES - 1) * tokens_processed * (routing_bytes_per_token + output_bytes_per_token)
+    # Interconnect: Two All-to-All operations for expert routing.
+    # 1. Send token activations to the nodes with the selected experts.
+    # 2. Receive expert outputs and sum them.
+    # Each All-to-All involves moving `tokens_processed` activations of size HIDDEN_DIM.
+    bytes_per_token = HIDDEN_DIM * ACTIVATION_BYTES
+    interconnect_per_forward_pass = 2 * tokens_processed * bytes_per_token
 
     # No KV cache for MLP
     kv_cache_bytes = 0.0

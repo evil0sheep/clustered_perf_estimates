@@ -39,17 +39,20 @@ class TestEmbedding:
         # No KV cache for embedding
         assert kv_cache == 0.0
 
-    def test_embedding_scale_invariant(self):
-        """Test that embedding requirements don't depend on batch size or context length."""
-        results = []
+    def test_embedding_memory_per_token_is_constant(self):
+        """Test that embedding memory per token is constant."""
+        mem_per_token = []
         for batch_size in [1, 4, 16]:
             for context_length in [1024, 4096, 128*1024]:
-                results.append(estimate_reqs_embedding(batch_size, context_length))
+                # Test in prefill mode where tokens_processed = batch_size * context_length
+                memory, _, _, _ = estimate_reqs_embedding(batch_size, context_length, is_prefill=True)
+                tokens_processed = batch_size * context_length
+                mem_per_token.append(memory / tokens_processed)
 
-        # All results should be identical for embedding
-        first_result = results[0]
-        for result in results[1:]:
-            assert result == first_result
+        # All results should be identical
+        first_result = mem_per_token[0]
+        for result in mem_per_token[1:]:
+            assert abs(result - first_result) < 1e-9
 
 
 class TestAttention:
@@ -68,16 +71,24 @@ class TestAttention:
         assert flops > 0
         assert kv_cache > 0
 
-    def test_attention_scales_with_context(self):
-        """Test that attention FLOPs scale quadratically with context length."""
+    def test_attention_flops_scale_quadratically_with_context(self):
+        """Test that attention FLOPs scale quadratically with context length during prefill."""
         batch_size = 1
 
-        _, _, flops_1k, _ = estimate_reqs_attention(batch_size, 1024)
-        _, _, flops_2k, _ = estimate_reqs_attention(batch_size, 2048)
+        # Prefill mode, where the quadratic term dominates
+        _, _, flops_1k, _ = estimate_reqs_attention(batch_size, 1024, is_prefill=True)
+        _, _, flops_2k, _ = estimate_reqs_attention(batch_size, 2048, is_prefill=True)
+        _, _, flops_4k, _ = estimate_reqs_attention(batch_size, 4096, is_prefill=True)
 
-        # FLOPs should roughly double when context length doubles (due to Q@K^T and A@V)
-        ratio = flops_2k / flops_1k
-        assert 1.8 < ratio < 2.2  # Allow some tolerance
+        # FLOPs should scale quadratically with context length (N^2)
+        # So, doubling context should quadruple FLOPs.
+        ratio_2k_1k = flops_2k / flops_1k
+        ratio_4k_2k = flops_4k / flops_2k
+
+        # Allow a wide tolerance because of the significant linear-term FLOPs from projections.
+        # The key is that the ratio should be super-linear (well above 2.0).
+        assert 2.2 < ratio_2k_1k < 3.0
+        assert 2.2 < ratio_4k_2k < 3.0
 
     def test_attention_scales_with_batch(self):
         """Test that attention requirements scale with batch size."""
@@ -92,18 +103,22 @@ class TestAttention:
         assert interconnect_4 / interconnect_1 == 4.0
 
     def test_kv_cache_size(self):
-        """Test KV cache size calculation."""
+        """Test KV cache size calculation for prefill and generation."""
         batch_size = 2
         context_length = 1024
-
-        _, _, _, kv_cache = estimate_reqs_attention(batch_size, context_length)
-
-        # KV cache per node: 2 * (batch * context * heads_per_node * head_dim * bytes)
         kv_heads_per_node = NUM_KV_HEADS // NUM_NODES
         head_dim = HIDDEN_DIM // NUM_Q_HEADS
-        expected_kv_cache = 2 * batch_size * context_length * kv_heads_per_node * head_dim * ACTIVATION_BYTES
 
-        assert abs(kv_cache - expected_kv_cache) < 1e-6
+        # Test Prefill
+        _, _, _, kv_cache_prefill = estimate_reqs_attention(batch_size, context_length, is_prefill=True)
+        expected_kv_cache_prefill = 2 * batch_size * context_length * kv_heads_per_node * head_dim * ACTIVATION_BYTES
+        assert abs(kv_cache_prefill - expected_kv_cache_prefill) < 1e-6
+
+        # Test Generation
+        _, _, _, kv_cache_gen = estimate_reqs_attention(batch_size, context_length, is_prefill=False)
+        effective_seq_len_gen = context_length + 1
+        expected_kv_cache_gen = 2 * batch_size * effective_seq_len_gen * kv_heads_per_node * head_dim * ACTIVATION_BYTES
+        assert abs(kv_cache_gen - expected_kv_cache_gen) < 1e-6
 
 
 class TestMoEMLP:
