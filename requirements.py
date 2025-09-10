@@ -33,276 +33,224 @@ PARAM_BYTES = 1  # 8-bit quantized parameters
 ACTIVATION_BYTES = 2  # fp16 activations
 
 
-def estimate_reqs_embedding(batch_size: int, context_length: int = 128 * 1024, is_prefill: bool = False) -> Tuple[float, float, float, float]:
+def _estimate_reqs_attention_pass(batch_size: int, num_new_tokens: int, kv_cache_size: int) -> Tuple[float, float, float, float]:
     """
-    Estimate requirements for embedding layer per forward pass.
+    Estimate requirements for a single GQA attention block for a single forward pass.
 
     Args:
         batch_size: Number of sequences in batch
-        context_length: Sequence length in tokens
-        is_prefill: If True, assume empty KV cache (prefill). If False, assume populated cache (generation)
+        num_new_tokens: Number of new tokens being processed in this pass
+        kv_cache_size: Number of tokens already in the KV cache
 
     Returns:
-        (memory_bus_bytes_per_forward_pass, interconnect_bytes_per_forward_pass,
-         floating_point_ops_per_forward_pass, max_kv_cache_bytes)
+        (memory_bus_bytes, interconnect_bytes, floating_point_ops, max_kv_cache_bytes)
     """
-    # Determine tokens processed in this forward pass
-    tokens_processed = (context_length * batch_size) if is_prefill else batch_size
+    tokens_processed = batch_size * num_new_tokens
+    effective_seq_len = kv_cache_size + num_new_tokens
 
-    # Embedding lookup: just indexing, not matrix multiplication
-    # Memory bandwidth: read embedding parameters for each token
-    memory_per_token = HIDDEN_DIM * PARAM_BYTES
-    memory_per_forward_pass = memory_per_token * tokens_processed
-
-    # No interconnect communication for embedding lookup
-    interconnect_per_forward_pass = 0.0
-
-    # No FLOPs for embedding lookup (just memory access)
-    flops_per_forward_pass = 0.0
-
-    # No KV cache for embedding layer
-    kv_cache_bytes = 0.0
-
-    return memory_per_forward_pass, interconnect_per_forward_pass, flops_per_forward_pass, kv_cache_bytes
-
-
-def estimate_reqs_attention(batch_size: int, context_length: int = 128 * 1024, is_prefill: bool = False) -> Tuple[float, float, float, float]:
-    """
-    Estimate requirements for a single GQA attention block per forward pass.
-
-    With GQA, we have 64 Q heads and 4 KV heads distributed across 4 nodes.
-    Each node handles 16 Q heads and 1 KV head group.
-
-    Args:
-        batch_size: Number of sequences in batch
-        context_length: Sequence length in tokens
-        is_prefill: If True, assume empty KV cache (prefill). If False, assume populated cache (generation)
-
-    Returns:
-        (memory_bus_bytes_per_forward_pass, interconnect_bytes_per_forward_pass,
-         floating_point_ops_per_forward_pass, max_kv_cache_bytes)
-    """
-    # Determine effective sequence length for attention computation
-    if is_prefill:
-        # During prefill, we process the entire context at once
-        effective_seq_len = context_length
-        tokens_processed = context_length * batch_size
-    else:
-        # During generation, we only process 1 new token but attend to full context
-        effective_seq_len = context_length + 1  # Attending to existing + new token
-        tokens_processed = batch_size  # Only processing 1 new token per sequence
-
-    # Parameter sizes (per node) - reused across batch, so amortize over batch_size
-    q_params = (HIDDEN_DIM * HIDDEN_DIM // NUM_NODES) * PARAM_BYTES  # 16 of 64 heads
-    kv_params = (HIDDEN_DIM * (HIDDEN_DIM // NUM_Q_HEADS * NUM_KV_HEADS) // NUM_NODES) * PARAM_BYTES  # 1 of 4 KV heads
-    o_params = (HIDDEN_DIM * HIDDEN_DIM // NUM_NODES) * PARAM_BYTES  # Output projection split
-
+    # Parameter sizes (per node)
+    q_params = (HIDDEN_DIM * HIDDEN_DIM // NUM_NODES) * PARAM_BYTES
+    kv_params = (HIDDEN_DIM * (HIDDEN_DIM // NUM_Q_HEADS * NUM_KV_HEADS) // NUM_NODES) * PARAM_BYTES
+    o_params = (HIDDEN_DIM * HIDDEN_DIM // NUM_NODES) * PARAM_BYTES
     memory_per_forward_pass = q_params + kv_params + o_params
 
-    # Flash Attention: only need to read/write Q, K, V, O - no large attention matrices materialized
-    # Activation memory reads/writes for all tokens processed
+    # Activation memory reads/writes
     q_activations = tokens_processed * (HIDDEN_DIM // NUM_NODES) * ACTIVATION_BYTES
     kv_activations = tokens_processed * (HIDDEN_DIM // NUM_Q_HEADS * NUM_KV_HEADS // NUM_NODES) * ACTIVATION_BYTES
     attention_output = tokens_processed * (HIDDEN_DIM // NUM_NODES) * ACTIVATION_BYTES
-
     memory_per_forward_pass += q_activations + kv_activations + attention_output
 
-    # KV cache reads during attention computation
-    if not is_prefill and effective_seq_len > 1:
-        # During generation, we read existing KV cache for all sequences
+    # KV cache reads
+    if kv_cache_size > 0:
         kv_heads_per_node = NUM_KV_HEADS // NUM_NODES
-        kv_cache_read = batch_size * (effective_seq_len - 1) * kv_heads_per_node * HEAD_DIM * ACTIVATION_BYTES * 2  # K + V
+        kv_cache_read = batch_size * kv_cache_size * kv_heads_per_node * HEAD_DIM * ACTIVATION_BYTES * 2  # K + V
         memory_per_forward_pass += kv_cache_read
 
-    # FLOPs for all tokens processed (per node)
-    # Each FMA is 2 FLOPs (multiply + add)
+    # FLOPs (per node)
     heads_per_node = NUM_Q_HEADS // NUM_NODES
     kv_heads_per_node = NUM_KV_HEADS // NUM_NODES
-
-    # Q, K, V projections from hidden dim.
-    # Note: HIDDEN_DIM = NUM_Q_HEADS * HEAD_DIM
     q_proj_flops = tokens_processed * 2 * HIDDEN_DIM * (heads_per_node * HEAD_DIM)
     k_proj_flops = tokens_processed * 2 * HIDDEN_DIM * (kv_heads_per_node * HEAD_DIM)
     v_proj_flops = tokens_processed * 2 * HIDDEN_DIM * (kv_heads_per_node * HEAD_DIM)
-
-    # Attention computation (assumes Flash Attention)
-    # Q @ K^T
     qk_flops = tokens_processed * 2 * heads_per_node * effective_seq_len * HEAD_DIM
-    # Attention weights @ V
     av_flops = tokens_processed * 2 * heads_per_node * effective_seq_len * HEAD_DIM
-
-    # Output projection. Input is HIDDEN_DIM, output is HIDDEN_DIM.
-    # Matrix is column-split, so each node computes (HIDDEN_DIM, HIDDEN_DIM / NUM_NODES)
     o_proj_flops = tokens_processed * 2 * HIDDEN_DIM * (HIDDEN_DIM // NUM_NODES)
-
     flops_per_forward_pass = q_proj_flops + k_proj_flops + v_proj_flops + qk_flops + av_flops + o_proj_flops
 
-    # Interconnect: gather attention outputs from all nodes for all tokens processed
+    # Interconnect
     interconnect_per_forward_pass = (NUM_NODES - 1) * tokens_processed * (HIDDEN_DIM // NUM_NODES) * ACTIVATION_BYTES
 
-    # KV cache per node: stores keys and values for 1 KV head group
+    # KV cache size
     kv_heads_per_node = NUM_KV_HEADS // NUM_NODES
     kv_cache_per_head = batch_size * effective_seq_len * HEAD_DIM * ACTIVATION_BYTES
-    kv_cache_bytes = 2 * kv_heads_per_node * kv_cache_per_head  # K + V
+    kv_cache_bytes = 2 * kv_heads_per_node * kv_cache_per_head
 
     return memory_per_forward_pass, interconnect_per_forward_pass, flops_per_forward_pass, kv_cache_bytes
 
-
-def estimate_reqs_moe_mlp(batch_size: int, context_length: int = 128 * 1024, is_prefill: bool = False) -> Tuple[float, float, float, float]:
+def _estimate_reqs_moe_mlp_pass(batch_size: int, num_new_tokens: int) -> Tuple[float, float, float, float]:
     """
-    Estimate requirements for MoE MLP block per forward pass.
-
-    Each node has 32 experts, and on average 2 experts per node are activated per token.
-    Expert routing is replicated across nodes.
-
-    Args:
-        batch_size: Number of sequences in batch
-        context_length: Sequence length in tokens
-        is_prefill: If True, assume empty KV cache (prefill). If False, assume populated cache (generation)
-
-    Returns:
-        (memory_bus_bytes_per_forward_pass, interconnect_bytes_per_forward_pass,
-         floating_point_ops_per_forward_pass, max_kv_cache_bytes)
+    Estimate requirements for MoE MLP block for a single forward pass.
     """
-    tokens_processed = (context_length * batch_size) if is_prefill else batch_size
+    tokens_processed = batch_size * num_new_tokens
 
-    # Parameters per expert (SwiGLU: gate, up, down projections)
-    gate_params = HIDDEN_DIM * INTERMEDIATE_DIM * PARAM_BYTES
-    up_params = HIDDEN_DIM * INTERMEDIATE_DIM * PARAM_BYTES
-    down_params = INTERMEDIATE_DIM * HIDDEN_DIM * PARAM_BYTES
-    params_per_expert = gate_params + up_params + down_params
-
-    # Memory bandwidth: read parameters for activated experts only (reused across batch)
+    # Parameter memory
+    params_per_expert = (HIDDEN_DIM * INTERMEDIATE_DIM * 3) * PARAM_BYTES
     expert_params_total = ACTIVATED_EXPERTS_PER_NODE * params_per_expert
-
-    # Gating network parameters (reused across batch)
-    gate_network_params = HIDDEN_DIM * TOTAL_EXPERTS * PARAM_BYTES // NUM_NODES
-
+    gate_network_params = (HIDDEN_DIM * TOTAL_EXPERTS // NUM_NODES) * PARAM_BYTES
     memory_per_forward_pass = expert_params_total + gate_network_params
 
-    # Activations for all tokens processed: read input, write/read intermediates, write final output
-    # Input is read once, final output is written once. Intermediates are per-expert.
+    # Activation memory
     input_activation_bytes = tokens_processed * HIDDEN_DIM * ACTIVATION_BYTES
-    intermediate_activation_bytes = tokens_processed * ACTIVATED_EXPERTS_PER_NODE * (
-        INTERMEDIATE_DIM +  # Gate output
-        INTERMEDIATE_DIM +  # Up output
-        INTERMEDIATE_DIM    # SwiGLU output (written then read)
-    ) * ACTIVATION_BYTES
+    intermediate_activation_bytes = tokens_processed * ACTIVATED_EXPERTS_PER_NODE * (INTERMEDIATE_DIM * 3) * ACTIVATION_BYTES
     output_activation_bytes = tokens_processed * HIDDEN_DIM * ACTIVATION_BYTES
     expert_activations = input_activation_bytes + intermediate_activation_bytes + output_activation_bytes
-
     memory_per_forward_pass += expert_activations
 
-    # FLOPs for all tokens processed. Each FMA is 2 FLOPs.
-    # Gating network FLOPs
+    # FLOPs
     gate_flops = tokens_processed * 2 * HIDDEN_DIM * (TOTAL_EXPERTS // NUM_NODES)
-
-    # Expert FLOPs (per expert)
     flops_per_expert = tokens_processed * (
-        2 * HIDDEN_DIM * INTERMEDIATE_DIM +  # Gate projection
-        2 * HIDDEN_DIM * INTERMEDIATE_DIM +  # Up projection
-        INTERMEDIATE_DIM +                   # SwiGLU activation
-        2 * INTERMEDIATE_DIM * HIDDEN_DIM    # Down projection
+        2 * HIDDEN_DIM * INTERMEDIATE_DIM +
+        2 * HIDDEN_DIM * INTERMEDIATE_DIM +
+        INTERMEDIATE_DIM +
+        2 * INTERMEDIATE_DIM * HIDDEN_DIM
     )
     expert_flops = ACTIVATED_EXPERTS_PER_NODE * flops_per_expert
     flops_per_forward_pass = gate_flops + expert_flops
 
-    # Interconnect: Two All-to-All operations for expert routing.
-    # 1. Send token activations to the nodes with the selected experts.
-    # 2. Receive expert outputs and sum them.
-    # Each All-to-All involves moving `tokens_processed` activations of size HIDDEN_DIM.
+    # Interconnect
     bytes_per_token = HIDDEN_DIM * ACTIVATION_BYTES
     interconnect_per_forward_pass = 2 * tokens_processed * bytes_per_token
 
-    # No KV cache for MLP
-    kv_cache_bytes = 0.0
+    return memory_per_forward_pass, interconnect_per_forward_pass, flops_per_forward_pass, 0.0
 
-    return memory_per_forward_pass, interconnect_per_forward_pass, flops_per_forward_pass, kv_cache_bytes
+def _estimate_reqs_transformer_layer_pass(batch_size: int, num_new_tokens: int, kv_cache_size: int) -> Tuple[float, float, float, float]:
+    """Estimate requirements for a complete transformer layer for a single forward pass."""
+    attn_mem, attn_inter, attn_flops, attn_kv = _estimate_reqs_attention_pass(batch_size, num_new_tokens, kv_cache_size)
+    mlp_mem, mlp_inter, mlp_flops, _ = _estimate_reqs_moe_mlp_pass(batch_size, num_new_tokens)
 
+    tokens_processed = batch_size * num_new_tokens
+    layernorm_params = 2 * HIDDEN_DIM * PARAM_BYTES
+    layernorm_flops = 2 * tokens_processed * HIDDEN_DIM
+
+    total_memory = attn_mem + mlp_mem + layernorm_params
+    total_interconnect = attn_inter + mlp_inter
+    total_flops = attn_flops + mlp_flops + layernorm_flops
+
+    return total_memory, total_interconnect, total_flops, attn_kv
+
+def _estimate_reqs_embedding_pass(batch_size: int, num_new_tokens: int) -> Tuple[float, float, float, float]:
+    """Estimate requirements for the embedding layer for a single forward pass."""
+    tokens_processed = batch_size * num_new_tokens
+    memory = tokens_processed * HIDDEN_DIM * PARAM_BYTES
+    return memory, 0.0, 0.0, 0.0
+
+def estimate_reqs_embedding(batch_size: int, context_length: int = 128 * 1024, is_prefill: bool = False) -> Tuple[float, float, float, float]:
+    """
+    Estimate requirements for embedding layer per forward pass.
+    (Wrapper for backward compatibility)
+    """
+    num_new_tokens = context_length if is_prefill else 1
+    return _estimate_reqs_embedding_pass(batch_size, num_new_tokens)
+
+def estimate_reqs_attention(batch_size: int, context_length: int = 128 * 1024, is_prefill: bool = False) -> Tuple[float, float, float, float]:
+    """
+    Estimate requirements for a single GQA attention block per forward pass.
+    (Wrapper for backward compatibility)
+    """
+    if is_prefill:
+        return _estimate_reqs_attention_pass(batch_size, num_new_tokens=context_length, kv_cache_size=0)
+    else:
+        return _estimate_reqs_attention_pass(batch_size, num_new_tokens=1, kv_cache_size=context_length)
+
+def estimate_reqs_moe_mlp(batch_size: int, context_length: int = 128 * 1024, is_prefill: bool = False) -> Tuple[float, float, float, float]:
+    """
+    Estimate requirements for MoE MLP block per forward pass.
+    (Wrapper for backward compatibility)
+    """
+    num_new_tokens = context_length if is_prefill else 1
+    return _estimate_reqs_moe_mlp_pass(batch_size, num_new_tokens)
 
 def estimate_reqs_transformer_layer(batch_size: int, context_length: int = 128 * 1024, is_prefill: bool = False) -> Tuple[float, float, float, float]:
     """
     Estimate requirements for a complete transformer layer (attention + MoE MLP) per forward pass.
-
-    Args:
-        batch_size: Number of sequences in batch
-        context_length: Sequence length in tokens
-        is_prefill: If True, assume empty KV cache (prefill). If False, assume populated cache (generation)
-
-    Returns:
-        (memory_bus_bytes_per_forward_pass, interconnect_bytes_per_forward_pass,
-         floating_point_ops_per_forward_pass, max_kv_cache_bytes)
+    (Wrapper for backward compatibility)
     """
-    # Get attention requirements
-    attn_memory, attn_interconnect, attn_flops, attn_kv_cache = estimate_reqs_attention(
-        batch_size, context_length, is_prefill)
-
-    # Get MoE MLP requirements
-    mlp_memory, mlp_interconnect, mlp_flops, mlp_kv_cache = estimate_reqs_moe_mlp(
-        batch_size, context_length, is_prefill)
-
-    # Layer norms: 2 per layer, minimal cost
-    tokens_processed = (context_length * batch_size) if is_prefill else batch_size
-    layernorm_params = 2 * HIDDEN_DIM * PARAM_BYTES
-    layernorm_flops = 2 * tokens_processed * HIDDEN_DIM
-
-    # Combine requirements
-    total_memory = attn_memory + mlp_memory + layernorm_params
-    total_interconnect = attn_interconnect + mlp_interconnect
-    total_flops = attn_flops + mlp_flops + layernorm_flops
-    total_kv_cache = attn_kv_cache + mlp_kv_cache
-
-    return total_memory, total_interconnect, total_flops, total_kv_cache
-
+    if is_prefill:
+        return _estimate_reqs_transformer_layer_pass(batch_size, num_new_tokens=context_length, kv_cache_size=0)
+    else:
+        return _estimate_reqs_transformer_layer_pass(batch_size, num_new_tokens=1, kv_cache_size=context_length)
 
 def estimate_reqs_qwen3(batch_size: int, context_length: int = 128 * 1024, is_prefill: bool = False) -> Tuple[float, float, float, float]:
     """
     Estimate requirements for complete Qwen3-235B-A22B model per forward pass.
-
-    Args:
-        batch_size: Number of sequences in batch
-        context_length: Sequence length in tokens
-        is_prefill: If True, assume empty KV cache (prefill). If False, assume populated cache (generation)
-
-    Returns:
-        (memory_bus_bytes_per_forward_pass, interconnect_bytes_per_forward_pass,
-         floating_point_ops_per_forward_pass, max_kv_cache_bytes)
+    (Wrapper for backward compatibility)
     """
-    tokens_processed = (context_length * batch_size) if is_prefill else batch_size
+    if is_prefill:
+        num_new_tokens = context_length
+        kv_cache_size = 0
+    else:
+        num_new_tokens = 1
+        kv_cache_size = context_length
+
+    tokens_processed = batch_size * num_new_tokens
 
     # Embedding layer
-    emb_memory, emb_interconnect, emb_flops, emb_kv_cache = estimate_reqs_embedding(
-        batch_size, context_length, is_prefill)
+    emb_mem, emb_inter, emb_flops, _ = _estimate_reqs_embedding_pass(batch_size, num_new_tokens)
 
     # All transformer layers
-    layer_memory, layer_interconnect, layer_flops, layer_kv_cache = estimate_reqs_transformer_layer(
-        batch_size, context_length, is_prefill)
+    layer_mem, layer_inter, layer_flops, layer_kv = _estimate_reqs_transformer_layer_pass(batch_size, num_new_tokens, kv_cache_size)
 
-    # Output projection (language modeling head) - parameters reused across batch
-    output_memory = HIDDEN_DIM * VOCAB_SIZE * PARAM_BYTES // NUM_NODES
-    output_flops = tokens_processed * HIDDEN_DIM * (VOCAB_SIZE // NUM_NODES)
-    output_interconnect = (NUM_NODES - 1) * tokens_processed * (VOCAB_SIZE // NUM_NODES) * ACTIVATION_BYTES
+    # Output projection (language modeling head)
+    output_mem = (HIDDEN_DIM * VOCAB_SIZE // NUM_NODES) * PARAM_BYTES
+    output_flops = tokens_processed * 2 * HIDDEN_DIM * (VOCAB_SIZE // NUM_NODES)
+    output_inter = (NUM_NODES - 1) * tokens_processed * (VOCAB_SIZE // NUM_NODES) * ACTIVATION_BYTES
 
     # Combine all components
-    total_memory = emb_memory + NUM_LAYERS * layer_memory + output_memory
-    total_interconnect = emb_interconnect + NUM_LAYERS * layer_interconnect + output_interconnect
+    total_memory = emb_mem + NUM_LAYERS * layer_mem + output_mem
+    total_interconnect = emb_inter + NUM_LAYERS * layer_inter + output_inter
     total_flops = emb_flops + NUM_LAYERS * layer_flops + output_flops
-    total_kv_cache = emb_kv_cache + NUM_LAYERS * layer_kv_cache
+    total_kv_cache = NUM_LAYERS * layer_kv
 
     return total_memory, total_interconnect, total_flops, total_kv_cache
 
+def estimate_reqs_qwen3_chunked_prefill(batch_size: int, context_length: int, chunk_size: int) -> Tuple[float, float, float, float]:
+    """
+    Estimate total requirements for a complete Qwen3 model using chunked prefill.
+    """
+    total_mem, total_inter, total_flops = 0.0, 0.0, 0.0
+    final_kv_cache = 0.0
+
+    for i in range(0, context_length, chunk_size):
+        current_chunk_size = min(chunk_size, context_length - i)
+        kv_cache_size = i
+
+        # We only need to calculate the cost of the final layer's KV cache size
+        if i + current_chunk_size >= context_length:
+             _, _, _, final_kv_cache = _estimate_reqs_transformer_layer_pass(batch_size, current_chunk_size, kv_cache_size)
+             final_kv_cache *= NUM_LAYERS
+
+        # Embedding for the current chunk
+        emb_mem, emb_inter, emb_flops, _ = _estimate_reqs_embedding_pass(batch_size, current_chunk_size)
+
+        # Transformer layers for the current chunk
+        layer_mem, layer_inter, layer_flops, _ = _estimate_reqs_transformer_layer_pass(batch_size, current_chunk_size, kv_cache_size)
+
+        # Output projection for the current chunk
+        tokens_processed = batch_size * current_chunk_size
+        output_mem = (HIDDEN_DIM * VOCAB_SIZE // NUM_NODES) * PARAM_BYTES
+        output_flops = tokens_processed * 2 * HIDDEN_DIM * (VOCAB_SIZE // NUM_NODES)
+        output_inter = (NUM_NODES - 1) * tokens_processed * (VOCAB_SIZE // NUM_NODES) * ACTIVATION_BYTES
+
+        # Accumulate totals
+        total_mem += emb_mem + NUM_LAYERS * layer_mem + output_mem
+        total_inter += emb_inter + NUM_LAYERS * layer_inter + output_inter
+        total_flops += emb_flops + NUM_LAYERS * layer_flops + output_flops
+
+    return total_mem, total_inter, total_flops, final_kv_cache
 
 def breakdown_memory_bandwidth(batch_size: int, context_length: int = 128 * 1024, is_prefill: bool = False) -> Dict[str, Any]:
     """
     Provide detailed breakdown of where memory bandwidth is being used per forward pass.
-
-    Args:
-        batch_size: Number of sequences in batch
-        context_length: Sequence length in tokens
-        is_prefill: If True, assume empty KV cache (prefill). If False, assume populated cache (generation)
-
-    Returns:
-        Dict with detailed breakdown of memory usage by component per forward pass
     """
     tokens_processed = (context_length * batch_size) if is_prefill else batch_size
 
@@ -429,7 +377,7 @@ if __name__ == "__main__":
     for component, data in prefill_breakdown['components'].items():
         print(f"  {component}: {data['total_bytes_per_forward_pass'] / 1e9:.2f} GB")
 
-    print("\n" + "="*50)
+    print("\n" + "="*50 + "\n")
     print("=== GENERATION MODE ===")
     gen_breakdown = breakdown_memory_bandwidth(batch_size, context_length, is_prefill=False)
     memory_bw, interconnect_bw, flops, kv_cache = estimate_reqs_qwen3(batch_size, context_length, is_prefill=False)
@@ -445,7 +393,7 @@ if __name__ == "__main__":
     for component, data in gen_breakdown['components'].items():
         print(f"  {component}: {data['total_bytes_per_forward_pass'] / 1e9:.2f} GB")
 
-    print("\n" + "="*50)
+    print("\n" + "="*50 + "\n")
     print("=== SCALING COMPARISON ===")
     for bs in [1, 2, 4, 8]:
         prefill_mem, _, prefill_flops, _ = estimate_reqs_qwen3(bs, 4096, is_prefill=True)
