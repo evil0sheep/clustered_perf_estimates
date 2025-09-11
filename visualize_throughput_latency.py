@@ -2,6 +2,7 @@
 Generates plots for cluster throughput and time-to-first-token latency.
 """
 
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter, LogLocator
@@ -13,7 +14,7 @@ MEMORY_BANDWIDTH_PER_NODE = 256e9  # 256 GB/s
 INTERCONNECT_BANDWIDTH_PER_NODE = 189e9 / 8  # 189 gbps -> 23.625 GB/s
 FLOPS_PER_NODE = 126e12  # 126 TOPS
 
-def _calculate_performance_data(estimation_func, batch_sizes, context_lengths, is_prefill, chunk_size=None):
+def _calculate_performance_data(estimation_func, batch_sizes, context_lengths, is_prefill, chunk_size=None, overlap_compute_interconnect=True):
     """
     Helper function to calculate performance and utilization data for different scenarios.
     """
@@ -41,7 +42,12 @@ def _calculate_performance_data(estimation_func, batch_sizes, context_lengths, i
             t_mem = mem / MEMORY_BANDWIDTH_PER_NODE
             t_inter = inter / INTERCONNECT_BANDWIDTH_PER_NODE
             t_flops = flops / FLOPS_PER_NODE
-            t_pass = max(t_mem, t_inter, t_flops)
+
+            if overlap_compute_interconnect:
+                t_pass = max(t_mem, t_inter, t_flops)
+            else:
+                t_gpu = max(t_mem, t_flops)
+                t_pass = t_gpu + t_inter
 
             if is_prefill:
                 metrics.append(t_pass * 1000)  # ms for latency
@@ -61,9 +67,10 @@ def _calculate_performance_data(estimation_func, batch_sizes, context_lengths, i
     return perf_data, util_data
 
 
-def generate_performance_plots():
+def generate_performance_plots(log_y=True):
     """
-    Generates and displays plots for cluster throughput, latency, and utilization.
+    Generates and displays plots for cluster throughput, latency, and utilization,
+    comparing performance with and without computation/communication overlap.
     """
     # --- Scenarios ---
     gen_batch_sizes = [2**i for i in range(11)]  # 1, 2, 4, ..., 1024
@@ -74,163 +81,209 @@ def generate_performance_plots():
     chunk_size = 256
 
     # --- Data Calculation ---
-    gen_perf_data, gen_util_data = _calculate_performance_data(
-        estimate_reqs_qwen3, gen_batch_sizes, gen_context_lengths, is_prefill=False
+    # 100% Overlap
+    gen_perf_data_overlap, gen_util_data_overlap = _calculate_performance_data(
+        estimate_reqs_qwen3, gen_batch_sizes, gen_context_lengths, is_prefill=False, overlap_compute_interconnect=True
     )
-    prefill_perf_data, prefill_util_data = _calculate_performance_data(
-        estimate_reqs_qwen3, prefill_batch_sizes, prefill_prompt_lengths, is_prefill=True
+    chunked_perf_data_overlap, chunked_util_data_overlap = _calculate_performance_data(
+        estimate_reqs_qwen3_chunked_prefill, prefill_batch_sizes, prefill_prompt_lengths, is_prefill=True, chunk_size=chunk_size, overlap_compute_interconnect=True
     )
-    chunked_prefill_perf_data, chunked_prefill_util_data = _calculate_performance_data(
-        estimate_reqs_qwen3_chunked_prefill, prefill_batch_sizes, prefill_prompt_lengths, is_prefill=True, chunk_size=chunk_size
+    # 0% Overlap
+    gen_perf_data_no_overlap, gen_util_data_no_overlap = _calculate_performance_data(
+        estimate_reqs_qwen3, gen_batch_sizes, gen_context_lengths, is_prefill=False, overlap_compute_interconnect=False
     )
+    chunked_perf_data_no_overlap, chunked_util_data_no_overlap = _calculate_performance_data(
+        estimate_reqs_qwen3_chunked_prefill, prefill_batch_sizes, prefill_prompt_lengths, is_prefill=True, chunk_size=chunk_size, overlap_compute_interconnect=False
+    )
+
 
     # --- Plotting ---
-    fig, axs = plt.subplots(3, 3, figsize=(16,12), sharex='col')
+    fig, axs = plt.subplots(3, 4, figsize=(22, 12), sharex='col')
 
     # Main Title and Subtitle
-    fig.suptitle('Theoretical Cluster Performance and Bottleneck Analysis', fontsize=20)
+    fig.suptitle('Theoretical Cluster Performance: 100% vs 0% Compute/Communication Overlap', fontsize=20)
     subtitle = (
-        "Model: Qwen3-235B-A22B (235B Total, 22B Active, 8-bit) | "
-        "Cluster: 4 Nodes, Fully Connected Mesh\n"
-        "Per Node: 256 GB/s Memory BW, 189 gbps Interconnect BW, 126 TOPS AI"
+        "Model: Qwen3-235B-A22B (8-bit) | Cluster: 4 Nodes | Per Node: 256 GB/s Mem BW, 189 gbps Interconnect, 126 TOPS"
     )
-    fig.text(0.5, 0.92, subtitle, ha='center', fontsize=12)
-
+    fig.text(0.5, 0.94, subtitle, ha='center', fontsize=12)
 
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     linestyles = {'mem': '-', 'inter': '--', 'flops': ':'}
     label_fontsize = 12
     tick_fontsize = 10
 
-    # == Column 1: Generation Throughput ==
-    axs[0, 0].set_title('Generation Throughput', fontsize=14)
-    axs[0, 0].set_ylabel('Batches per Second', fontsize=label_fontsize)
-    axs[0, 0].set_yscale('log')
-    for i, (ctx, throughputs) in enumerate(gen_perf_data.items()):
-        axs[0, 0].plot(gen_batch_sizes, throughputs, color=colors[i], label=f'Context: {ctx} tokens')
-    axs[0, 0].legend()
-    axs[0, 0].grid(True, which="both", ls="--")
-    axs[0, 0].tick_params(axis='y', labelsize=tick_fontsize)
+    # Share Y axes for adjacent plots
+    for i in range(3):
+        axs[i, 1].sharey(axs[i, 0])
+        axs[i, 3].sharey(axs[i, 2])
 
+    # == Column 1: Generation Throughput (100% Overlap) ==
+    ax = axs[0, 0]
+    ax.set_title('Generation Throughput (100% Overlap)', fontsize=14)
+    ax.set_ylabel('Batches per Second', fontsize=label_fontsize)
+    if log_y:
+        ax.set_yscale('log')
+    for i, (ctx, throughputs) in enumerate(gen_perf_data_overlap.items()):
+        ax.plot(gen_batch_sizes, throughputs, color=colors[i], label=f'Context: {ctx} tokens')
+    ax.legend()
+    ax.grid(True, which="both", ls="--")
+    ax.tick_params(axis='y', labelsize=tick_fontsize)
 
-    # Utilization for smallest context
+    # Utilization for smallest context (100% Overlap)
+    ax = axs[1, 0]
     ctx_small = gen_context_lengths[0]
-    utils_small = gen_util_data[ctx_small]
-    axs[1, 0].set_title(f'Resource Utilization (Context: {ctx_small} Tokens)', fontsize=14)
-    axs[1, 0].set_ylabel('Utilization (%)', fontsize=label_fontsize)
-    axs[1, 0].plot(gen_batch_sizes, utils_small['mem'], color=colors[0], linestyle=linestyles['mem'], label='Memory BW')
-    axs[1, 0].plot(gen_batch_sizes, utils_small['inter'], color=colors[0], linestyle=linestyles['inter'], label='Interconnect BW')
-    axs[1, 0].plot(gen_batch_sizes, utils_small['flops'], color=colors[0], linestyle=linestyles['flops'], label='FLOPs')
-    axs[1, 0].set_ylim(0, 1.1)
-    axs[1, 0].yaxis.set_major_formatter(PercentFormatter(1.0))
-    axs[1, 0].grid(True, which="both", ls="--")
-    axs[1, 0].legend()
-    axs[1, 0].tick_params(axis='y', labelsize=tick_fontsize)
+    utils_small = gen_util_data_overlap[ctx_small]
+    ax.set_title(f'Utilization (Context Size: {ctx_small}, 100% Overlap)', fontsize=14)
+    ax.set_ylabel('Utilization (%)', fontsize=label_fontsize)
+    ax.plot(gen_batch_sizes, utils_small['mem'], color=colors[0], linestyle=linestyles['mem'], label='Memory BW')
+    ax.plot(gen_batch_sizes, utils_small['inter'], color=colors[0], linestyle=linestyles['inter'], label='Interconnect BW')
+    ax.plot(gen_batch_sizes, utils_small['flops'], color=colors[0], linestyle=linestyles['flops'], label='FLOPs')
+    ax.set_ylim(0, 1.1)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.grid(True, which="both", ls="--")
+    ax.legend()
+    ax.tick_params(axis='y', labelsize=tick_fontsize)
 
-    # Utilization for largest context
+    # Utilization for largest context (100% Overlap)
+    ax = axs[2, 0]
     ctx_large = gen_context_lengths[-1]
-    utils_large = gen_util_data[ctx_large]
+    utils_large = gen_util_data_overlap[ctx_large]
     color_large_ctx = colors[len(gen_context_lengths) - 1]
-    axs[2, 0].set_title(f'Resource Utilization (Context: {ctx_large} Tokens)', fontsize=14)
-    axs[2, 0].set_ylabel('Utilization (%)', fontsize=label_fontsize)
-    axs[2, 0].plot(gen_batch_sizes, utils_large['mem'], color=color_large_ctx, linestyle=linestyles['mem'], label='Memory BW')
-    axs[2, 0].plot(gen_batch_sizes, utils_large['inter'], color=color_large_ctx, linestyle=linestyles['inter'], label='Interconnect BW')
-    axs[2, 0].plot(gen_batch_sizes, utils_large['flops'], color=color_large_ctx, linestyle=linestyles['flops'], label='FLOPs')
-    axs[2, 0].set_ylim(0, 1.1)
-    axs[2, 0].yaxis.set_major_formatter(PercentFormatter(1.0))
-    axs[2, 0].grid(True, which="both", ls="--")
-    axs[2, 0].legend()
-    axs[2, 0].set_xlabel('Batch Size', fontsize=label_fontsize)
-    axs[2, 0].set_xscale('log', base=2)
-    axs[2, 0].tick_params(axis='both', labelsize=tick_fontsize)
+    ax.set_title(f'Utilization (Context Size: {ctx_large}, 100% Overlap)', fontsize=14)
+    ax.set_ylabel('Utilization (%)', fontsize=label_fontsize)
+    ax.plot(gen_batch_sizes, utils_large['mem'], color=color_large_ctx, linestyle=linestyles['mem'], label='Memory BW')
+    ax.plot(gen_batch_sizes, utils_large['inter'], color=color_large_ctx, linestyle=linestyles['inter'], label='Interconnect BW')
+    ax.plot(gen_batch_sizes, utils_large['flops'], color=color_large_ctx, linestyle=linestyles['flops'], label='FLOPs')
+    ax.set_ylim(0, 1.1)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.grid(True, which="both", ls="--")
+    ax.legend()
+    ax.set_xlabel('Batch Size', fontsize=label_fontsize)
+    ax.set_xscale('log', base=2)
+    ax.tick_params(axis='both', labelsize=tick_fontsize)
+
+    # == Column 2: Generation Throughput (0% Overlap) ==
+    ax = axs[0, 1]
+    ax.set_title('Generation Throughput (0% Overlap)', fontsize=14)
+    if log_y:
+        ax.set_yscale('log')
+    for i, (ctx, throughputs) in enumerate(gen_perf_data_no_overlap.items()):
+        ax.plot(gen_batch_sizes, throughputs, color=colors[i], label=f'Context: {ctx} tokens')
+    ax.legend()
+    ax.grid(True, which="both", ls="--")
+
+    # Utilization for smallest context (0% Overlap)
+    ax = axs[1, 1]
+    utils_small = gen_util_data_no_overlap[ctx_small]
+    ax.set_title(f'Utilization (Context Size: {ctx_small}, 0% Overlap)', fontsize=14)
+    ax.plot(gen_batch_sizes, utils_small['mem'], color=colors[0], linestyle=linestyles['mem'], label='Memory BW')
+    ax.plot(gen_batch_sizes, utils_small['inter'], color=colors[0], linestyle=linestyles['inter'], label='Interconnect BW')
+    ax.plot(gen_batch_sizes, utils_small['flops'], color=colors[0], linestyle=linestyles['flops'], label='FLOPs')
+    ax.set_ylim(0, 1.1)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.grid(True, which="both", ls="--")
+    ax.legend()
+
+    # Utilization for largest context (0% Overlap)
+    ax = axs[2, 1]
+    utils_large = gen_util_data_no_overlap[ctx_large]
+    ax.set_title(f'Utilization (Context Size: {ctx_large}, 0% Overlap)', fontsize=14)
+    ax.plot(gen_batch_sizes, utils_large['mem'], color=color_large_ctx, linestyle=linestyles['mem'], label='Memory BW')
+    ax.plot(gen_batch_sizes, utils_large['inter'], color=color_large_ctx, linestyle=linestyles['inter'], label='Interconnect BW')
+    ax.plot(gen_batch_sizes, utils_large['flops'], color=color_large_ctx, linestyle=linestyles['flops'], label='FLOPs')
+    ax.set_ylim(0, 1.1)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.grid(True, which="both", ls="--")
+    ax.legend()
+    ax.set_xlabel('Batch Size', fontsize=label_fontsize)
+    ax.set_xscale('log', base=2)
+    ax.tick_params(axis='x', labelsize=tick_fontsize)
 
 
-    # == Column 2: Prefill Latency (No Chunking) ==
-    axs[0, 1].set_title('Time To First Token (No Chunking)', fontsize=14)
-    axs[0, 1].set_ylabel('Time To First Token (ms)', fontsize=label_fontsize)
-    axs[0, 1].set_yscale('log')
-    for i, (bs, latencies) in enumerate(prefill_perf_data.items()):
-        axs[0, 1].plot(prefill_prompt_lengths, latencies, color=colors[i], label=f'Batch Size: {bs}')
-    axs[0, 1].legend()
-    axs[0, 1].grid(True, which="both", ls="--")
-    axs[0, 1].tick_params(axis='y', labelsize=tick_fontsize)
+    # == Column 3: TTFT (Chunked, 100% Overlap) ==
+    ax = axs[0, 2]
+    ax.set_title(f'TTFT (Chunked, 100% Overlap)', fontsize=14)
+    ax.set_ylabel('Time To First Token (ms)', fontsize=label_fontsize)
+    if log_y:
+        ax.set_yscale('log')
+    for i, (bs, latencies) in enumerate(chunked_perf_data_overlap.items()):
+        ax.plot(prefill_prompt_lengths, latencies, color=colors[i], label=f'Batch Size: {bs}')
+    ax.legend()
+    ax.grid(True, which="both", ls="--")
 
-    # Utilization for smallest batch size (No Chunking)
+    # Utilization for smallest batch size (Chunked, 100% Overlap)
+    ax = axs[1, 2]
     bs_small = prefill_batch_sizes[0]
-    utils_small = prefill_util_data[bs_small]
-    axs[1, 1].set_title(f'Resource Utilization (Batch Size: {bs_small})', fontsize=14)
-    axs[1, 1].set_ylabel('Utilization (%)', fontsize=label_fontsize)
-    axs[1, 1].plot(prefill_prompt_lengths, utils_small['mem'], color=colors[0], linestyle=linestyles['mem'], label='Memory BW')
-    axs[1, 1].plot(prefill_prompt_lengths, utils_small['inter'], color=colors[0], linestyle=linestyles['inter'], label='Interconnect BW')
-    axs[1, 1].plot(prefill_prompt_lengths, utils_small['flops'], color=colors[0], linestyle=linestyles['flops'], label='FLOPs')
-    axs[1, 1].set_ylim(0, 1.1)
-    axs[1, 1].yaxis.set_major_formatter(PercentFormatter(1.0))
-    axs[1, 1].grid(True, which="both", ls="--")
-    axs[1, 1].legend()
-    axs[1, 1].tick_params(axis='y', labelsize=tick_fontsize)
+    utils_small = chunked_util_data_overlap[bs_small]
+    ax.set_title(f'Utilization (Batch Size: {bs_small}, 100% Overlap)', fontsize=14)
+    ax.set_ylabel('Utilization (%)', fontsize=label_fontsize)
+    ax.plot(prefill_prompt_lengths, utils_small['mem'], color=colors[0], linestyle=linestyles['mem'], label='Memory BW')
+    ax.plot(prefill_prompt_lengths, utils_small['inter'], color=colors[0], linestyle=linestyles['inter'], label='Interconnect BW')
+    ax.plot(prefill_prompt_lengths, utils_small['flops'], color=colors[0], linestyle=linestyles['flops'], label='FLOPs')
+    ax.set_ylim(0, 1.1)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.grid(True, which="both", ls="--")
+    ax.legend()
 
-    # Utilization for largest batch size (No Chunking)
+    # Utilization for largest batch size (Chunked, 100% Overlap)
+    ax = axs[2, 2]
     bs_large = prefill_batch_sizes[-1]
-    utils_large = prefill_util_data[bs_large]
+    utils_large = chunked_util_data_overlap[bs_large]
     color_large_bs = colors[len(prefill_batch_sizes) - 1]
-    axs[2, 1].set_title(f'Resource Utilization (Batch Size: {bs_large})', fontsize=14)
-    axs[2, 1].set_ylabel('Utilization (%)', fontsize=label_fontsize)
-    axs[2, 1].plot(prefill_prompt_lengths, utils_large['mem'], color=color_large_bs, linestyle=linestyles['mem'], label='Memory BW')
-    axs[2, 1].plot(prefill_prompt_lengths, utils_large['inter'], color=color_large_bs, linestyle=linestyles['inter'], label='Interconnect BW')
-    axs[2, 1].plot(prefill_prompt_lengths, utils_large['flops'], color=color_large_bs, linestyle=linestyles['flops'], label='FLOPs')
-    axs[2, 1].set_ylim(0, 1.1)
-    axs[2, 1].yaxis.set_major_formatter(PercentFormatter(1.0))
-    axs[2, 1].grid(True, which="both", ls="--")
-    axs[2, 1].legend()
-    axs[2, 1].set_xlabel('Prompt Length (Tokens)', fontsize=label_fontsize)
-    axs[2, 1].set_xscale('log', base=2)
-    axs[2, 1].tick_params(axis='both', labelsize=tick_fontsize)
+    ax.set_title(f'Utilization (Batch Size: {bs_large}, 100% Overlap)', fontsize=14)
+    ax.set_ylabel('Utilization (%)', fontsize=label_fontsize)
+    ax.plot(prefill_prompt_lengths, utils_large['mem'], color=color_large_bs, linestyle=linestyles['mem'], label='Memory BW')
+    ax.plot(prefill_prompt_lengths, utils_large['inter'], color=color_large_bs, linestyle=linestyles['inter'], label='Interconnect BW')
+    ax.plot(prefill_prompt_lengths, utils_large['flops'], color=color_large_bs, linestyle=linestyles['flops'], label='FLOPs')
+    ax.set_ylim(0, 1.1)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.grid(True, which="both", ls="--")
+    ax.legend()
+    ax.set_xlabel('Prompt Length (Tokens)', fontsize=label_fontsize)
+    ax.set_xscale('log', base=2)
+    ax.tick_params(axis='both', labelsize=tick_fontsize)
 
-    # == Column 3: Prefill Latency (Chunked) ==
-    axs[0, 2].set_title(f'Time To First Token (Chunked Prefill, {chunk_size} Tokens/Chunk)', fontsize=14)
-    axs[0, 2].set_ylabel('Time To First Token (ms)', fontsize=label_fontsize)
-    axs[0, 2].set_yscale('log')
-    for i, (bs, latencies) in enumerate(chunked_prefill_perf_data.items()):
-        axs[0, 2].plot(prefill_prompt_lengths, latencies, color=colors[i], label=f'Batch Size: {bs}')
-    axs[0, 2].legend()
-    axs[0, 2].grid(True, which="both", ls="--")
-    axs[0, 2].tick_params(axis='y', labelsize=tick_fontsize)
 
-    # Utilization for smallest batch size (Chunked)
-    bs_small = prefill_batch_sizes[0]
-    utils_small = chunked_prefill_util_data[bs_small]
-    axs[1, 2].set_title(f'Resource Utilization (Batch Size: {bs_small})', fontsize=14)
-    axs[1, 2].set_ylabel('Utilization (%)', fontsize=label_fontsize)
-    axs[1, 2].plot(prefill_prompt_lengths, utils_small['mem'], color=colors[0], linestyle=linestyles['mem'], label='Memory BW')
-    axs[1, 2].plot(prefill_prompt_lengths, utils_small['inter'], color=colors[0], linestyle=linestyles['inter'], label='Interconnect BW')
-    axs[1, 2].plot(prefill_prompt_lengths, utils_small['flops'], color=colors[0], linestyle=linestyles['flops'], label='FLOPs')
-    axs[1, 2].set_ylim(0, 1.1)
-    axs[1, 2].yaxis.set_major_formatter(PercentFormatter(1.0))
-    axs[1, 2].grid(True, which="both", ls="--")
-    axs[1, 2].legend()
-    axs[1, 2].tick_params(axis='y', labelsize=tick_fontsize)
+    # == Column 4: TTFT (Chunked, 0% Overlap) ==
+    ax = axs[0, 3]
+    ax.set_title(f'TTFT (Chunked, 0% Overlap)', fontsize=14)
+    if log_y:
+        ax.set_yscale('log')
+    for i, (bs, latencies) in enumerate(chunked_perf_data_no_overlap.items()):
+        ax.plot(prefill_prompt_lengths, latencies, color=colors[i], label=f'Batch Size: {bs}')
+    ax.legend()
+    ax.grid(True, which="both", ls="--")
 
-    # Utilization for largest batch size (Chunked)
-    bs_large = prefill_batch_sizes[-1]
-    utils_large = chunked_prefill_util_data[bs_large]
-    color_large_bs = colors[len(prefill_batch_sizes) - 1]
-    axs[2, 2].set_title(f'Resource Utilization (Batch Size: {bs_large})', fontsize=14)
-    axs[2, 2].set_ylabel('Utilization (%)', fontsize=label_fontsize)
-    axs[2, 2].plot(prefill_prompt_lengths, utils_large['mem'], color=color_large_bs, linestyle=linestyles['mem'], label='Memory BW')
-    axs[2, 2].plot(prefill_prompt_lengths, utils_large['inter'], color=color_large_bs, linestyle=linestyles['inter'], label='Interconnect BW')
-    axs[2, 2].plot(prefill_prompt_lengths, utils_large['flops'], color=color_large_bs, linestyle=linestyles['flops'], label='FLOPs')
-    axs[2, 2].set_ylim(0, 1.1)
-    axs[2, 2].yaxis.set_major_formatter(PercentFormatter(1.0))
-    axs[2, 2].grid(True, which="both", ls="--")
-    axs[2, 2].legend()
-    axs[2, 2].set_xlabel('Prompt Length (Tokens)', fontsize=label_fontsize)
-    axs[2, 2].set_xscale('log', base=2)
-    axs[2, 2].tick_params(axis='both', labelsize=tick_fontsize)
+    # Utilization for smallest batch size (Chunked, 0% Overlap)
+    ax = axs[1, 3]
+    utils_small = chunked_util_data_no_overlap[bs_small]
+    ax.set_title(f'Utilization (Batch Size: {bs_small}, 0% Overlap)', fontsize=14)
+    ax.plot(prefill_prompt_lengths, utils_small['mem'], color=colors[0], linestyle=linestyles['mem'], label='Memory BW')
+    ax.plot(prefill_prompt_lengths, utils_small['inter'], color=colors[0], linestyle=linestyles['inter'], label='Interconnect BW')
+    ax.plot(prefill_prompt_lengths, utils_small['flops'], color=colors[0], linestyle=linestyles['flops'], label='FLOPs')
+    ax.set_ylim(0, 1.1)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.grid(True, which="both", ls="--")
+    ax.legend()
+
+    # Utilization for largest batch size (Chunked, 0% Overlap)
+    ax = axs[2, 3]
+    utils_large = chunked_util_data_no_overlap[bs_large]
+    ax.set_title(f'Utilization (Batch Size: {bs_large}, 0% Overlap)', fontsize=14)
+    ax.plot(prefill_prompt_lengths, utils_large['mem'], color=color_large_bs, linestyle=linestyles['mem'], label='Memory BW')
+    ax.plot(prefill_prompt_lengths, utils_large['inter'], color=color_large_bs, linestyle=linestyles['inter'], label='Interconnect BW')
+    ax.plot(prefill_prompt_lengths, utils_large['flops'], color=color_large_bs, linestyle=linestyles['flops'], label='FLOPs')
+    ax.set_ylim(0, 1.1)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.grid(True, which="both", ls="--")
+    ax.legend()
+    ax.set_xlabel('Prompt Length (Tokens)', fontsize=label_fontsize)
+    ax.set_xscale('log', base=2)
+    ax.tick_params(axis='x', labelsize=tick_fontsize)
 
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.92])
     plt.savefig('cluster_performance.png')
-    plt.show()
 
 def generate_2d_performance_plots():
     """
@@ -316,9 +369,12 @@ def generate_2d_performance_plots():
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig('performance_vs_batch_size.png')
-    plt.show()
 
 
 if __name__ == "__main__":
-    generate_performance_plots()
+    parser = argparse.ArgumentParser(description='Generate performance plots for Qwen3 cluster.')
+    parser.add_argument('--log_y', action=argparse.BooleanOptionalAction, default=True, help='Use a logarithmic y-axis for the top row of plots.')
+    args = parser.parse_args()
+
+    generate_performance_plots(log_y=args.log_y)
     generate_2d_performance_plots()
