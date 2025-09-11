@@ -4,7 +4,8 @@ Generates plots for cluster throughput and time-to-first-token latency.
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.ticker import PercentFormatter
+from matplotlib.ticker import PercentFormatter, LogLocator
+from matplotlib.colors import LogNorm
 from requirements import estimate_reqs_qwen3, estimate_reqs_qwen3_chunked_prefill
 
 # Hardware constants from README
@@ -231,5 +232,93 @@ def generate_performance_plots():
     plt.savefig('cluster_performance.png')
     plt.show()
 
+def generate_2d_performance_plots():
+    """
+    Generates 2D colormap plots for throughput and latency vs. batch size and context length.
+    """
+    batch_sizes = [2**i for i in range(11)]  # 1, 2, 4, ..., 1024
+    context_lengths = [2**i for i in range(18)] # 1, 2, 4, ..., 128k
+    chunk_size = 256
+
+    batches_per_sec = np.zeros((len(context_lengths), len(batch_sizes)))
+    tok_per_sec = np.zeros((len(context_lengths), len(batch_sizes)))
+    ttft = np.zeros((len(context_lengths), len(batch_sizes)))
+    ttft_chunked = np.zeros((len(context_lengths), len(batch_sizes)))
+
+    for i, ctx in enumerate(context_lengths):
+        for j, bs in enumerate(batch_sizes):
+            # Generation throughput
+            mem_gen, inter_gen, flops_gen, _ = estimate_reqs_qwen3(bs, ctx, is_prefill=False)
+            t_pass_gen = max(mem_gen / MEMORY_BANDWIDTH_PER_NODE,
+                             inter_gen / INTERCONNECT_BANDWIDTH_PER_NODE,
+                             flops_gen / FLOPS_PER_NODE)
+            batches_per_sec[i, j] = 1.0 / t_pass_gen if t_pass_gen > 0 else 0
+            tok_per_sec[i, j] = bs / t_pass_gen if t_pass_gen > 0 else 0
+
+            # Prefill TTFT (ms) - No Chunking
+            mem_prefill, inter_prefill, flops_prefill, _ = estimate_reqs_qwen3(bs, ctx, is_prefill=True)
+            t_pass_prefill = max(mem_prefill / MEMORY_BANDWIDTH_PER_NODE,
+                                 inter_prefill / INTERCONNECT_BANDWIDTH_PER_NODE,
+                                 flops_prefill / FLOPS_PER_NODE)
+            ttft[i, j] = t_pass_prefill * 1000
+
+            # Prefill TTFT (ms) - Chunked
+            first_chunk_context = min(ctx, chunk_size)
+            mem_chunked, inter_chunked, flops_chunked, _ = estimate_reqs_qwen3(bs, first_chunk_context, is_prefill=True)
+            t_pass_chunked = max(mem_chunked / MEMORY_BANDWIDTH_PER_NODE,
+                                 inter_chunked / INTERCONNECT_BANDWIDTH_PER_NODE,
+                                 flops_chunked / FLOPS_PER_NODE)
+            ttft_chunked[i, j] = t_pass_chunked * 1000
+
+
+    fig, axs = plt.subplots(2, 2, figsize=(20, 16))
+    fig.suptitle('Performance vs. Batch Size and Context Length', fontsize=16)
+
+    vmin = min(ttft[ttft > 0].min(), ttft_chunked[ttft_chunked > 0].min())
+    vmax = max(ttft.max(), ttft_chunked.max())
+
+    # Batches per Second plot
+    im1 = axs[0, 0].pcolormesh(batch_sizes, context_lengths, batches_per_sec, shading='auto', cmap='viridis')
+    axs[0, 0].set_title('Generation Throughput (Batches/Second)')
+    axs[0, 0].set_xscale('log', base=2)
+    axs[0, 0].set_yscale('log', base=2)
+    axs[0, 0].set_xlabel('Batch Size')
+    axs[0, 0].set_ylabel('Context Length')
+    fig.colorbar(im1, ax=axs[0, 0], label='Batches / Second')
+
+    # TTFT plot (No Chunking)
+    im2 = axs[0, 1].pcolormesh(batch_sizes, context_lengths, ttft, shading='auto', cmap='magma_r', norm=LogNorm(vmin=vmin, vmax=vmax))
+    axs[0, 1].set_title('Time To First Token (ms) - No Chunking')
+    axs[0, 1].set_xscale('log', base=2)
+    axs[0, 1].set_yscale('log', base=2)
+    axs[0, 1].set_xlabel('Batch Size')
+    axs[0, 1].set_ylabel('Context Length')
+    fig.colorbar(im2, ax=axs[0, 1], label='Milliseconds')
+
+    # Tokens per Second plot
+    im3 = axs[1, 0].pcolormesh(batch_sizes, context_lengths, tok_per_sec, shading='auto', cmap='viridis')
+    axs[1, 0].set_title('Generation Throughput (Total Tokens/Second)')
+    axs[1, 0].set_xscale('log', base=2)
+    axs[1, 0].set_yscale('log', base=2)
+    axs[1, 0].set_xlabel('Batch Size')
+    axs[1, 0].set_ylabel('Context Length')
+    fig.colorbar(im3, ax=axs[1, 0], label='Tokens / Second')
+
+    # TTFT plot (Chunked)
+    im4 = axs[1, 1].pcolormesh(batch_sizes, context_lengths, ttft_chunked, shading='auto', cmap='magma_r', norm=LogNorm(vmin=vmin, vmax=vmax))
+    axs[1, 1].set_title(f'Time To First Token (ms) - Chunked ({chunk_size} Tokens)')
+    axs[1, 1].set_xscale('log', base=2)
+    axs[1, 1].set_yscale('log', base=2)
+    axs[1, 1].set_xlabel('Batch Size')
+    axs[1, 1].set_ylabel('Context Length')
+    fig.colorbar(im4, ax=axs[1, 1], label='Milliseconds')
+
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig('performance_vs_batch_size.png')
+    plt.show()
+
+
 if __name__ == "__main__":
     generate_performance_plots()
+    generate_2d_performance_plots()
