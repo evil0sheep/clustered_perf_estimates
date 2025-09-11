@@ -12,6 +12,54 @@ MEMORY_BANDWIDTH_PER_NODE = 256e9  # 256 GB/s
 INTERCONNECT_BANDWIDTH_PER_NODE = 189e9 / 8  # 189 gbps -> 23.625 GB/s
 FLOPS_PER_NODE = 126e12  # 126 TOPS
 
+def _calculate_performance_data(estimation_func, batch_sizes, context_lengths, is_prefill, chunk_size=None):
+    """
+    Helper function to calculate performance and utilization data for different scenarios.
+    """
+    perf_data = {}
+    util_data = {}
+
+    outer_loop_vars = batch_sizes if is_prefill else context_lengths
+    inner_loop_vars = context_lengths if is_prefill else batch_sizes
+
+    for outer_var in outer_loop_vars:
+        metrics = []
+        utils_mem, utils_inter, utils_flops = [], [], []
+        for inner_var in inner_loop_vars:
+            if is_prefill:
+                bs, p_len = outer_var, inner_var
+            else:
+                bs, p_len = inner_var, outer_var
+
+            if estimation_func == estimate_reqs_qwen3_chunked_prefill:
+                first_chunk_size = min(p_len, chunk_size)
+                mem, inter, flops, _ = estimation_func(bs, first_chunk_size, chunk_size)
+            else:
+                mem, inter, flops, _ = estimation_func(bs, p_len, is_prefill=is_prefill)
+
+            t_mem = mem / MEMORY_BANDWIDTH_PER_NODE
+            t_inter = inter / INTERCONNECT_BANDWIDTH_PER_NODE
+            t_flops = flops / FLOPS_PER_NODE
+            t_pass = max(t_mem, t_inter, t_flops)
+
+            if is_prefill:
+                metrics.append(t_pass * 1000)  # ms for latency
+            else:
+                metrics.append(1.0 / t_pass if t_pass > 0 else 0) # batches/sec for throughput
+
+            if t_pass > 0:
+                utils_mem.append(t_mem / t_pass)
+                utils_inter.append(t_inter / t_pass)
+                utils_flops.append(t_flops / t_pass)
+            else:
+                utils_mem.append(0); utils_inter.append(0); utils_flops.append(0)
+
+        perf_data[outer_var] = metrics
+        util_data[outer_var] = {'mem': utils_mem, 'inter': utils_inter, 'flops': utils_flops}
+
+    return perf_data, util_data
+
+
 def generate_performance_plots():
     """
     Generates and displays plots for cluster throughput, latency, and utilization.
@@ -22,80 +70,18 @@ def generate_performance_plots():
 
     prefill_prompt_lengths = [2**i for i in range(18)] # 1, 2, 4, ..., 128k
     prefill_batch_sizes = [1, 8, 64, 256]
+    chunk_size = 256
 
     # --- Data Calculation ---
-    gen_perf_data = {}
-    gen_util_data = {}
-    for ctx in gen_context_lengths:
-        throughputs = []
-        utils_mem, utils_inter, utils_flops = [], [], []
-        for bs in gen_batch_sizes:
-            mem, inter, flops, _ = estimate_reqs_qwen3(bs, ctx, is_prefill=False)
-            t_mem = mem / MEMORY_BANDWIDTH_PER_NODE
-            t_inter = inter / INTERCONNECT_BANDWIDTH_PER_NODE
-            t_flops = flops / FLOPS_PER_NODE
-            t_pass = max(t_mem, t_inter, t_flops)
-
-            throughputs.append(1.0 / t_pass if t_pass > 0 else 0)
-            if t_pass > 0:
-                utils_mem.append(t_mem / t_pass)
-                utils_inter.append(t_inter / t_pass)
-                utils_flops.append(t_flops / t_pass)
-            else:
-                utils_mem.append(0); utils_inter.append(0); utils_flops.append(0)
-        gen_perf_data[ctx] = throughputs
-        gen_util_data[ctx] = {'mem': utils_mem, 'inter': utils_inter, 'flops': utils_flops}
-
-    prefill_perf_data = {}
-    prefill_util_data = {}
-    for bs in prefill_batch_sizes:
-        latencies = []
-        utils_mem, utils_inter, utils_flops = [], [], []
-        for p_len in prefill_prompt_lengths:
-            mem, inter, flops, _ = estimate_reqs_qwen3(bs, p_len, is_prefill=True)
-            t_mem = mem / MEMORY_BANDWIDTH_PER_NODE
-            t_inter = inter / INTERCONNECT_BANDWIDTH_PER_NODE
-            t_flops = flops / FLOPS_PER_NODE
-            t_pass = max(t_mem, t_inter, t_flops)
-
-            latencies.append(t_pass * 1000) # ms
-            if t_pass > 0:
-                utils_mem.append(t_mem / t_pass)
-                utils_inter.append(t_inter / t_pass)
-                utils_flops.append(t_flops / t_pass)
-            else:
-                utils_mem.append(0); utils_inter.append(0); utils_flops.append(0)
-        prefill_perf_data[bs] = latencies
-        prefill_util_data[bs] = {'mem': utils_mem, 'inter': utils_inter, 'flops': utils_flops}
-
-    chunked_prefill_perf_data = {}
-    chunked_prefill_util_data = {}
-    chunk_size = 256
-    for bs in prefill_batch_sizes:
-        latencies = []
-        utils_mem, utils_inter, utils_flops = [], [], []
-        for p_len in prefill_prompt_lengths:
-            # TTFT is the time to process the first chunk (or the whole prompt if smaller)
-            first_chunk_size = min(p_len, chunk_size)
-
-            mem, inter, flops, _ = estimate_reqs_qwen3_chunked_prefill(bs, first_chunk_size, chunk_size)
-
-            t_mem = mem / MEMORY_BANDWIDTH_PER_NODE
-            t_inter = inter / INTERCONNECT_BANDWIDTH_PER_NODE
-            t_flops = flops / FLOPS_PER_NODE
-            t_pass = max(t_mem, t_inter, t_flops)
-
-            latencies.append(t_pass * 1000) # ms
-            if t_pass > 0:
-                utils_mem.append(t_mem / t_pass)
-                utils_inter.append(t_inter / t_pass)
-                utils_flops.append(t_flops / t_pass)
-            else:
-                utils_mem.append(0); utils_inter.append(0); utils_flops.append(0)
-
-        chunked_prefill_perf_data[bs] = latencies
-        chunked_prefill_util_data[bs] = {'mem': utils_mem, 'inter': utils_inter, 'flops': utils_flops}
-
+    gen_perf_data, gen_util_data = _calculate_performance_data(
+        estimate_reqs_qwen3, gen_batch_sizes, gen_context_lengths, is_prefill=False
+    )
+    prefill_perf_data, prefill_util_data = _calculate_performance_data(
+        estimate_reqs_qwen3, prefill_batch_sizes, prefill_prompt_lengths, is_prefill=True
+    )
+    chunked_prefill_perf_data, chunked_prefill_util_data = _calculate_performance_data(
+        estimate_reqs_qwen3_chunked_prefill, prefill_batch_sizes, prefill_prompt_lengths, is_prefill=True, chunk_size=chunk_size
+    )
 
     # --- Plotting ---
     fig, axs = plt.subplots(3, 3, figsize=(16,12), sharex='col')
